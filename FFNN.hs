@@ -1,109 +1,317 @@
+{-# LANGUAGE FlexibleInstances #-}
 
 import Data.List
-import Control.Monad.State
+import Data.Maybe
+import qualified Data.Map.Strict as Map
+import Control.Lens
+import Control.Applicative
 import Debug.Trace
+
+{- Types -}
 
 type Weight = Double
 type Value = Double
 
-data Network = Net [Int] [[Value]] (Value -> Value)
+{- Graphs -}
 
-nodes :: [Int]
-nodes = [2,3,1]
+type NodeMap = Map.Map Int Value
 
-bias :: [[Value]]
-bias = [[0,0],[0,0,0],[0]]
+data AdjacencyList = Adjacency (Map.Map (Int, Int) Weight) NodeMap deriving (Show)
+data Matrix = Matrix ([[Maybe Weight]]) NodeMap deriving (Show)
 
-alpha :: Value
-alpha = 0.004
+class IsGraph a where
+    getWeight :: Int -> Int -> a -> Maybe Weight
+    getValue :: Int -> a -> Maybe Value
+    setWeight :: Int -> Int -> Weight -> a -> a
+    setValue :: Int -> Value -> a -> a
+    linksFrom :: Int -> a -> [Int]
 
-initial_weights :: [[[Weight]]]
-initial_weights = [[[0,1],[1,1],[1,0]],[[1,-2,1]]]
+instance IsGraph AdjacencyList where
+    getWeight from to (Adjacency graph _) = Map.lookup (from, to) graph
+    getValue node (Adjacency _ nodes) = Map.lookup node nodes 
+    setWeight from to weight (Adjacency graph nodes) = let
+                                                        newGraph = Map.insert (from, to) weight graph
+                                                       in
+                                                        Adjacency newGraph nodes
+    setValue node val (Adjacency graph nodes) = let
+                                                    newNodes = Map.insert node val nodes
+                                                in
+                                                    Adjacency graph newNodes
+    linksFrom node (Adjacency graph _) = map snd . Map.keys . Map.filterWithKey (\k _ -> fst k == node) $ graph
 
-sigmoid :: Double -> Double
-sigmoid x = 1 / ( 1 + exp(-x) )
+instance IsGraph Matrix where
+    getWeight from to (Matrix graph _) = graph ^? element from . element to >>= id
+    getValue node (Matrix _ nodes) = Map.lookup node nodes 
+    setWeight from to weight (Matrix graph nodes) = let
+                                                        newGraph = (element from . element to .~ Just weight) graph 
+                                                    in
+                                                        Matrix newGraph nodes
+    setValue node val (Matrix graph nodes) = let
+                                                newNodes = Map.insert node val nodes
+                                             in
+                                                Matrix graph newNodes
+    linksFrom node (Matrix graph _) = concat $ graph ^? element node >>= return . findIndices isJust
 
-sigmoid' :: Double -> Double
-sigmoid' x = x * ( 1 - x )
+{- Networks -}
 
-step :: Double -> Double
-step x | x >= 0 = 1
-       | x < 0 = -1
+type Layer = [Int]
+type Layers = [Layer]
+type NonLinearity = (Value -> Value, Value -> Value) {- (Function, Derivative -}
 
-dot :: (Num a) => [a] -> [a] -> a
-dot [] [] = 0
-dot (x:xs) (y:ys) = (x*y) + dot xs ys
-dot _ _ = error "Mismatched dimensions in dot product"
+instance Show (Double -> Double) where
+    show fn = "<Function>"
 
-zipWith' :: (a -> b -> c) -> [a] -> [b] -> [c]
-zipWith' _ [] [] = []
-zipWith' fn (x:xs) (y:ys) = fn x y : zipWith' fn xs ys
-zipWith' _ _ _ = error "Mismatched dimensions in zip"
+data Network g = Network {
+    getGraph :: g,
+    getLayers :: Layers,
+    getNonlin :: NonLinearity,
+    getAlpha :: Value,
+    getBias :: NodeMap
+} deriving (Show)
 
-zipWith3' :: (a -> b -> c -> d) -> [a] -> [b] -> [c] -> [d]
-zipWith3' _ [] [] [] = []
-zipWith3' fn (x:xs) (y:ys) (z:zs) = fn x y z : zipWith3' fn xs ys zs
-zipWith3' _ _ _ _ = error "Mismatched dimensions in zip3"
+updateGraph :: Network a -> a -> Network a
+updateGraph network graph = network { getGraph = graph }
 
-run :: Network -> [[[Weight]]] -> [Value] -> [[Value]]
-run (Net nodes bias fn) weights input = input : runNetwork (tail nodes) (tail bias) weights fn input
+class Neural a where
+    getOutput :: a -> Maybe [Value]
+    runNetwork :: a -> [Value] -> Maybe a
+    trainNetwork :: a -> [Value] -> Maybe a
+    learnFrom :: [Value] -> [Value] -> a -> Maybe a
+    evalError :: [Value] -> [Value] -> a -> Maybe Value
 
-runNetwork :: [Int] -> [[Value]] -> [[[Weight]]] -> (Value -> Value) -> [Value] -> [[Value]]
-runNetwork [] _ _ _ _ = []
-runNetwork nodes@(x:xs) bias@(y:ys) weights@(z:zs) fn input = let
-                                                                layer = runLayer x y z fn input
-                                                              in
-                                                                layer : runNetwork xs ys zs fn layer
-
-runLayer :: Int -> [Value] -> [[Weight]] -> (Value -> Value) -> [Value] -> [Value]
-runLayer 0 values _ _ _ = values
-runLayer n bias weights fn input = update (head bias) : runLayer (n-1) (tail bias) (tail weights) fn input
+instance (Show a, IsGraph a) => Neural (Network a) where
+    getOutput network = last' (getLayers network) >>=
+                        sequence . map (flip getValue (getGraph network))
+    runNetwork network input = let
+                                layers = getLayers network
+                                biases = head' layers >>=
+                                         return . map (flip (Map.findWithDefault 0) $ getBias network)
+                                biasedInputs = biases >>= zipWith' ($) (map (+) input)
+                                insertions = fmap (zipWith' setValue) (head' layers) <*> biasedInputs >>= id
+                                inputGraph = flip (foldl (.) id) (getGraph network) <$> insertions
+                               in
+                                inputGraph >>=
+                                go layers >>=
+                                return . updateGraph network
         where
-            update :: Value -> Value
-            update x = fn $ dot input (head weights) + x
-
-calcError :: Network -> [[[Weight]]] -> ([Value],[Value]) -> Value
-calcError net weights (inp, out) = (/2) . sum . map (\x -> x*x) . zipWith' (-) out . last $ run net weights inp
-
-trainM :: Network -> ([Value],[Value]) -> State [[[Weight]]] ()
-trainM net io = get >>= put . flip (train net) io
-
-train :: Network -> [[[Weight]]] -> ([Value],[Value]) -> [[[Weight]]]
-train net@(Net nodes bias fn) weights io@(inp, out) = let
-                                                        state = run net weights inp
-                                                        error = calcError net weights io
-                                                      in
-                                                        traceShow ("error:", calcError net weights io) $ backpropogate nodes weights state out error
-
-backpropogate :: [Int] -> [[[Weight]]] -> [[Value]] -> [Value] -> Value -> [[[Weight]]]
-backpropogate nodes weights state out err = mapErrors . reverse $ calcErr False (reverse weights) (reverse state) [err]
+            {- Flow layer x to y -}
+            go :: (Show a, IsGraph a) => Layers -> a -> Maybe a
+            go (x:y:ys) g = let
+                                biases = map (flip (Map.findWithDefault 0) $ getBias network) y
+                            in
+                                runLayer x y g biases (getNonlin network) >>=
+                                go (y:ys)
+            go _ g = Just g
+    trainNetwork network predic = let
+                                    reverseLayers = reverse $ getLayers network
+                                    output = head' reverseLayers >>=
+                                             sequence . map (flip getValue (getGraph network))
+                                    errorl = output >>=
+                                             zipWith' findErr predic
+                                                where
+                                                    findErr ex out = (ex - out) * (($ out) . snd $ getNonlin network)
+                                    insertions = fmap (zipWith' Map.insert) (head' reverseLayers) <*> errorl >>= id
+                                    errMap = flip (foldl (.) id) Map.empty <$> insertions >>= calcErr reverseLayers
+                                    errList = fmap (flip map reverseLayers . map . flip Map.lookup) errMap
+                                  in
+                                    (sequence . map sequence) <$> errList >>=
+                                    liftA2 (mapErr $ getGraph network) (tail' reverseLayers) >>=
+                                    fmap reverse >>=
+                                    applyWeights >>=
+                                    return . updateGraph network
         where
-            mapErrors :: [[Value]] -> [[[Weight]]]
-            mapErrors errors = zipWith3' (\error weight input -> map (zipWith3' (\e i w -> w+(alpha*e*i)) error input) weight) (init errors) weights (init state)
-            calcErr :: Bool -> [[[Weight]]] -> [[Value]] -> [Value] -> [[Value]]
-            calcErr _ _ [] _ = []
-            calcErr False rweights rstate errors = let
-                                                    nexterr expected output = (expected - output) * sigmoid'(output)
-                                                    layer = zipWith' nexterr out (head rstate)
-                                                   in
-                                                    layer : calcErr True rweights (tail rstate) layer
-            calcErr True rweights rstate errors = let
-                                                    tweights = transpose (head rweights)
-                                                    deltas = map (dot errors) tweights
-                                                    layer = zipWith' (*) deltas (head rstate)
+            calcErr :: Layers -> NodeMap -> Maybe NodeMap
+            calcErr (x:y:ys) errMap = backpropogate x y (getGraph network) (getNonlin network) errMap >>=
+                                      calcErr (y:ys)
+            calcErr _ m = Just m
+            mapErr g b@(y:ys) c@(e:es) = let
+                                        vals :: Maybe [Value]
+                                        vals = sequence $ map (flip getValue g) y
+                                        links :: [[Int]]
+                                        links = map (flip linksFrom g) y
+                                        oldWeights :: Maybe [[Weight]]
+                                        oldWeights = zipWith' findWeights y links >>= sequence
+                                            where
+                                                findWeights i os = sequence $ map (flip (getWeight i) g) os
+                                        newWeights :: Maybe [[Weight]]
+                                        newWeights = liftA2 (adjustWeights e) oldWeights vals >>= id
+                                       in
+                                        liftA2 (:) newWeights (mapErr g (ys) es)
+            mapErr _ b c = Just []
+            adjustWeights errors weights inputs = zipWith' (adjustWeights' errors) weights inputs >>= sequence
+            adjustWeights' errors weights input = zipWith' (adjustWeights'' input) errors weights
+            adjustWeights'' input error weight = let
+                                                    alpha = getAlpha network
+                                                 in
+                                                    weight - (alpha * error * input)
+            applyWeights weights = let
+                                    layers = getLayers network
+                                   in
+                                    applyWeights' weights layers >>=
+                                    return . flip (foldl (.) id) (getGraph network)
+            applyWeights' :: (IsGraph a) => [[[Weight]]] -> Layers -> Maybe [a -> a]
+            applyWeights' (w:ws) (x:y:ys) = liftA2 (++) (applyWeights'' w x y) (applyWeights' ws (y:ys))
+            applyWeights' [] [x] = Just []
+            applyWeights' _ _ = Nothing
+            applyWeights'' :: (IsGraph a) => [[Weight]] -> Layer -> Layer -> Maybe [a -> a]
+            applyWeights'' (w:ws) froml@(x:xs) tol = liftA2 (++) (applyWeights''' w x tol) (applyWeights'' ws xs tol)
+            applyWeights'' [] [] _ = Just []
+            applyWeights'' a b c = Nothing
+            applyWeights''' :: (IsGraph a) => [Weight] -> Int -> Layer -> Maybe [a -> a]
+            applyWeights''' (w:ws) from tol@(x:xs) = applyWeights''' ws from xs >>= return . (setWeight from x w :) 
+            applyWeights''' e@[] f g@[] = Just []
+            applyWeights''' a b c = Nothing
+                                                    
+    learnFrom input output network = runNetwork network input >>=
+                                     flip trainNetwork output
+    evalError input output network = runNetwork network input >>=
+                                     getOutput >>=
+                                     zipWith' (-) output >>=
+                                     return . (/2) . sum . map (\x -> x*x)
+
+backpropogate :: (Show a, IsGraph a) => Layer -> Layer -> a -> NonLinearity -> NodeMap -> Maybe NodeMap
+backpropogate froml tol graph nonlin errors = let
+                                                vals :: Maybe [Value]
+                                                vals = sequence $ map (flip getValue graph) tol
+                                                links :: [[Int]]
+                                                links = map (flip linksFrom graph) tol
+                                                weights :: Maybe [[Weight]]
+                                                weights = zipWith' findWeights tol links >>=
+                                                          sequence
+                                                    where
+                                                        findWeights i os = sequence $ map (flip (getWeight i) graph) os
+                                                errorl :: Maybe [Value]
+                                                errorl = sequence $ map (flip Map.lookup errors) froml
+                                              in
+                                                liftA3 go weights vals errorl >>=
+                                                id >>=
+                                                update tol
+        where
+            go :: [[Weight]] -> [Value] -> [Value] -> Maybe [Value]
+            go [] [] _ = Just []
+            go weights@(w:ws) output@(o:os) err = let
+                                                    fn = snd nonlin
+                                                    nextVal = dot' w err >>= 
+                                                              return . (* (fn o))
+                                                    restVals = go ws os err
                                                   in
-                                                    layer : calcErr True (tail rweights) (tail rstate) layer
+                                                    liftA2 (:) nextVal restVals
+            update nodes errorl = let
+                                    insertions = zipWith' Map.insert nodes errorl
+                                  in
+                                    fmap (foldl (flip ($)) errors) insertions
 
-iterateM :: (Monad m) => m () -> [m ()]
-iterateM monad = go monad
+runLayer :: (Show a, IsGraph a) => Layer -> Layer -> a -> [Value] -> NonLinearity -> Maybe a
+runLayer inl outl graph obias nonlin = let
+                                        vals :: Maybe [Value]
+                                        vals = sequence $ map (flip getValue graph) inl
+                                        links :: [[Int]]
+                                        links = map (flip linksFrom graph) inl
+                                        weights :: Maybe [[Weight]]
+                                        weights = zipWith' findWeights inl links >>=
+                                                  sequence
+                                            where
+                                                findWeights i os = sequence $ map (flip (getWeight i) graph) os
+                                       in
+                                        liftA2 (go obias) (fmap transpose weights) vals >>=
+                                        id >>=
+                                        update outl
         where
-            go m = m : go (m >> monad)
+            go :: [Value] -> [[Weight]] -> [Value] -> Maybe [Value]
+            go [] [] _ = Just []
+            go bias@(b:bs) weights@(w:ws) input = let
+                                                    fn = fst nonlin
+                                                    nextVal = (fn . (+ b)) <$> dot' input w
+                                                    restVals = go bs ws input
+                                                  in
+                                                    liftA2 (:) nextVal restVals
+            go _ _ _ = Nothing
+            update nodes values = let
+                                    insertions = zipWith' setValue nodes values
+                                  in
+                                    fmap (foldl (flip ($)) graph) insertions
 
-main :: IO ()    
-main = do        
-    let net = Net nodes bias sigmoid
-    putStrLn . show $ map (head . last . run net initial_weights) [[-1,-1],[-1,1],[1,-1],[1,1]]
-    putStrLn . show $ map (calcError net initial_weights) [([-1,-1],[1]),([-1,1],[-1]),([1,-1],[-1]),([1,1],[1])]
-    putStrLn . show $ map (train net initial_weights) [([-1,-1],[1]),([-1,1],[-1]),([1,-1],[-1]),([1,1],[1])]
-    let weights = flip execState initial_weights . (!! 100) . iterateM $ mapM_ ((!! 10) . iterateM . trainM net) [([-1,-1],[1]),([-1,1],[-1]),([1,-1],[-1]),([1,1],[1])]
-    putStrLn . show $ map (head . last . run net weights) [[-1,-1],[-1,1],[1,-1],[1,1]]
+{- Safe Utils -}
+
+head' :: [a] -> Maybe a
+head' (x:xs) = Just x
+head' [] = Nothing
+
+tail' :: [a] -> Maybe [a]
+tail' (x:xs) = Just xs
+tail' [] = Nothing
+
+init' :: [a] -> Maybe [a]
+init' [] = Nothing
+init' [x] = Just []
+init' (x:xs) = fmap (x:) (init' xs)
+
+last' :: [a] -> Maybe a
+last' [] = Nothing
+last' [x] = Just x
+last' (x:xs) = last' xs
+
+dot' :: (Num a) => [a] -> [a] -> Maybe a
+dot' [] [] = Just 0
+dot' (x:xs) (y:ys) = dot' xs ys >>= return . ((x*y) +)
+dot' _ _ = Nothing
+
+zipWith' :: (a -> b -> c) -> [a] -> [b] -> Maybe [c]
+zipWith' _ [] [] = Just []
+zipWith' fn (x:xs) (y:ys) = zipWith' fn xs ys >>= return . (fn x y :)
+zipWith' _ _ _ = Nothing
+
+zipWith3' :: (a -> b -> c -> d) -> [a] -> [b] -> [c] -> Maybe [d]
+zipWith3' _ [] [] [] = Just []
+zipWith3' fn (x:xs) (y:ys) (z:zs) = zipWith3' fn xs ys zs >>= return . (fn x y z :)
+zipWith3' _ _ _ _ = Nothing
+
+{- NonLinearities -}
+
+sigmoid :: NonLinearity
+sigmoid = (f, f')
+        where
+            f x = 1 / ( 1 + exp(-x) )
+            f' x = x * ( 1 - x )
+
+step :: NonLinearity
+step = (f, f')
+        where
+            f x | x >= 0 = 1
+                | x < 0 = -1
+            f' 0 = 1 / 0
+            f' x = 0 / 1
+
+{- Code -}
+
+createNetwork :: Network AdjacencyList
+createNetwork = Network graph layers nonlin alpha bias
+        where
+            graph = Adjacency (connectGraph Map.empty) Map.empty
+            layers = [[0,1],[2,3,4],[5]]
+            nonlin = sigmoid
+            alpha = -1.0
+            bias = Map.empty
+            connectGraph = Map.insert (0,2) 0
+                         . Map.insert (0,3) 1
+                         . Map.insert (0,4) 1
+                         . Map.insert (1,2) 1
+                         . Map.insert (1,3) 1
+                         . Map.insert (1,4) 0
+                         . Map.insert (2,5) 1
+                         . Map.insert (3,5) (-2)
+                         . Map.insert (4,5) 1
+
+main :: IO ()
+main = let
+        inputs :: [([Value],[Value])]
+        inputs = [([-1,-1],[1]),([-1,1],[-1]),([1,-1],[-1]),([1,1],[1])]
+        mapLearn :: (Show a, IsGraph a) => Network a -> Maybe [Network a]
+        mapLearn = sequence . flip map inputs . (flip $ uncurry learnFrom)
+        tryLearn :: ([Value],[Value]) -> Int -> IO ()
+        tryLearn input n = putStrLn (show input) >>
+                           mapM_ (putStrLn . show) (take n . map (uncurry evalError input) . iterate (fromJust . uncurry learnFrom input) $ createNetwork)
+       in
+        mapM_ (flip tryLearn 100) inputs >>
+        return ()
+
