@@ -56,7 +56,7 @@ instance IsGraph Matrix where
 
 type Layer = [Int]
 type Layers = [Layer]
-type NonLinearity = (Value -> Value, Value -> Value) {- (Function, Derivative -}
+type NonLinearity = (Value -> Value, Value -> Value) -- (Function, Derivative)
 
 instance Show (Double -> Double) where
     show fn = "<Function>"
@@ -161,7 +161,6 @@ instance (Show a, IsGraph a) => Neural (Network a) where
             applyWeights''' (w:ws) from tol@(x:xs) = applyWeights''' ws from xs >>= return . (setWeight from x w :) 
             applyWeights''' e@[] f g@[] = Just []
             applyWeights''' a b c = Nothing
-                                                    
     learnFrom input output network = runNetwork network input >>=
                                      flip trainNetwork output
     evalError input output network = runNetwork network input >>=
@@ -302,16 +301,34 @@ createNetwork = Network graph layers nonlin alpha bias
                          . Map.insert (3,5) (-2)
                          . Map.insert (4,5) 1
 
+trainOn :: (Show a, IsGraph a) => Int -> Network a -> [([Value],[Value])] -> Maybe (Network a)
+trainOn n network dataset = foldl (>>=) (Just network) $ map (trainN n) dataset
+        where
+            trainN :: (Show a, IsGraph a) => Int -> ([Value],[Value]) -> Network a -> Maybe (Network a)
+            trainN 0 input net = Just net
+            trainN n input net = uncurry learnFrom input net >>=
+                                 trainN (n-1) input
+
+mapNetwork :: (Show a, IsGraph a) => [[Value]] -> Network a -> [([Value],[Value])]
+mapNetwork inputs net = let
+                            outputs :: [[Value]]
+                            outputs = fromJust . sequence $ map ((>>= getOutput) . runNetwork net) inputs
+                        in
+                            zip inputs outputs
+
 main :: IO ()
 main = let
-        inputs :: [([Value],[Value])]
-        inputs = [([-1,-1],[1]),([-1,1],[-1]),([1,-1],[-1]),([1,1],[1])]
-        mapLearn :: (Show a, IsGraph a) => Network a -> Maybe [Network a]
-        mapLearn = sequence . flip map inputs . (flip $ uncurry learnFrom)
-        tryLearn :: ([Value],[Value]) -> Int -> IO ()
-        tryLearn input n = putStrLn (show input) >>
-                           mapM_ (putStrLn . show) (take n . map (uncurry evalError input) . iterate (fromJust . uncurry learnFrom input) $ createNetwork)
+        trainingSet :: [([Value],[Value])]
+        trainingSet = [([-1,-1],[1]),([-1,1],[-1]),([1,-1],[-1]),([1,1],[1])]
+        trainedNetwork :: Network AdjacencyList
+        trainedNetwork = trainNetwork trainingSet createNetwork
        in
-        mapM_ (flip tryLearn 100) inputs >>
-        return ()
+        (putStrLn . show . evalErrors trainingSet) trainedNetwork >>
+        (putStrLn . show) trainedNetwork >>
+        (mapM_ (putStrLn . show) . mapNetwork (map fst trainingSet)) trainedNetwork
+        where
+            trainNetwork :: (Show a, IsGraph a) => [([Value],[Value])] -> Network a -> Network a
+            trainNetwork set net = fromJust $ foldl (>>=) (Just net) (replicate 10 $ flip (trainOn 10) set)
+            evalErrors :: (Show a, IsGraph a) => [([Value],[Value])] -> Network a -> [Value]
+            evalErrors set net = fromJust . sequence $ map (flip (uncurry evalError) net) set
 
