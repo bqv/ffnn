@@ -6,6 +6,7 @@ import Data.Bits
 import Data.List
 import Data.Maybe
 import Debug.Trace
+import Data.Either
 import Text.Printf
 import Unsafe.Coerce
 import System.Random
@@ -71,26 +72,29 @@ crossoverGen left right = sequence . fmap sequence $ zipWith' chooseChromosome l
                                           return . ([left, right] !!)
 
 class HasGenotype a where
-    mutate :: a -> State StdGen (Maybe a)
+    mutate :: a -> State StdGen (Either String a)
     mutate citizen = let
                         mutant = toGenotype citizen >>= return . fmap fromGenotype . sequence . fmap mutateGen
                      in
-                        fmap (>>= id) . sequence $ mutant
-    crossover :: a -> a -> State StdGen (Maybe a)
+                        fmap (maybe (Left "Failed in mutation genotype conversion") Right . (>>= id)) . sequence $ mutant
+    crossover :: a -> a -> State StdGen (Either String a)
     crossover left right = let
                             leftGen = snd <$> toGenotype left
                             rightGen = snd <$> toGenotype right
-                            result = liftM2 crossoverGen leftGen rightGen >>=
-                                     return . fmap ((fromGenotype . (,) left) =<<)
+                            child = liftM2 crossoverGen leftGen rightGen >>=
+                                    return . fmap ((fromGenotype . (,) left) =<<)
                            in
-                            fmap (>>= id) . sequence $ result
+                            fmap (maybe (Left "Failed in crossover genotype conversion") Right . (>>= id)) . sequence $ child
 
     fitness :: a -> Double
     toGenotype :: a -> Maybe (a, Genotype ByteString)
     fromGenotype :: (a, Genotype ByteString) -> Maybe a
 
 instance (Show a, IsGraph a) => HasGenotype (Citizen (Network a)) where
-    fitness (Citizen net set) = maybe (1 / 0) sum . sequence $ map (flip (uncurry evalError) net) set
+    fitness (Citizen net set) = either (dropWith $ 1 / 0) sum . sequence $ map (flip (uncurry evalError) net) set
+            where
+                dropWith :: Double -> String -> Double
+                dropWith = const
     toGenotype citizen = let
                             graph = getGraph $ getNetwork citizen
                             layers = getLayers $ getNetwork citizen
@@ -128,11 +132,13 @@ evolve pop = let
                 breed elite
         where
             breed :: (Show a, IsGraph a) => Population (Network a) -> State StdGen (Population (Network a))
-            breed parents = fmap catMaybes (sequence $ crossover <$> parents <*> parents) >>=
-                            fmap ((parents ++) . catMaybes) . sequence . map mutate
+            breed parents = fmap dropLefts (sequence $ crossover <$> parents <*> parents) >>=
+                            fmap ((parents ++) . dropLefts) . sequence . map mutate
+            dropLefts :: [Either String a] -> [a]
+            dropLefts = rights
 
-takeMax :: (Show a, IsGraph a) => Population (Network a) -> Maybe (Citizen (Network a))
-takeMax = head' . sortOn fitness
+takeMax :: (Show a, IsGraph a) => Population (Network a) -> Either String (Citizen (Network a))
+takeMax = maybe (Left "Can't sample an empty population") Right . head' . sortOn fitness
 
 {- Code -}
 
@@ -144,39 +150,27 @@ seedPopulation count seed = fmap catMaybes . sequence $ replicate count (randomi
             randomBytes :: State StdGen ByteString
             randomBytes = fmap pack . sequence . replicate 4 $ state random
 
-trainOn :: (Show a, IsGraph a) => Int -> Network a -> [([Value],[Value])] -> Maybe (Network a)
-trainOn n network dataset = foldl (>>=) (Just network) $ map (trainN n) dataset
-        where
-            trainN :: (Show a, IsGraph a) => Int -> ([Value],[Value]) -> Network a -> Maybe (Network a)
-            trainN 0 input net = Just net
-            trainN n input net = uncurry learnFrom input net >>=
-                                 trainN (n-1) input
-
-mapNetwork :: (Show a, IsGraph a) => [[Value]] -> Network a -> [([Value],[Value])]
-mapNetwork inputs net = let
-                            outputs :: [[Value]]
-                            outputs = fromJust . sequence $ map ((>>= getOutput) . runNetwork net) inputs
-                        in
-                            zip inputs outputs
-
 iterateM :: (Monad m) => (a -> m a) -> a -> m [a]
 iterateM f x = f x >>= iterateM f >>= return . (x:)
 
+tryEvolution :: StdGen -> Either String [[Value]]
+tryEvolution rng = let
+                    trainingSet :: [([Value],[Value])]
+                    trainingSet = [([-1,-1],[1]),([-1,1],[-1]),([1,-1],[-1]),([1,1],[1])]
+                    patriarch :: Citizen (Network AdjacencyList)
+                    patriarch = Citizen createNetwork trainingSet
+                   in
+                    (takeMax . (!! 10) . evalState (iterateM evolve =<< seedPopulation 256 patriarch)) rng >>=
+                    trainNetwork trainingSet . getNetwork >>=
+                    sequence . sequence (map (flip runNetwork) (map fst trainingSet)) >>=
+                    sequence . map getOutput
+        where
+            trainNetwork :: (Show a, IsGraph a) => [([Value],[Value])] -> Network a -> Either String (Network a)
+            trainNetwork set net = foldl (>>=) (Right net) (replicate 10 $ flip (trainOn 10) set)
+            evalErrors :: (Show a, IsGraph a) => [([Value],[Value])] -> Network a -> Either String [Value]
+            evalErrors set net = sequence $ map (flip (uncurry evalError) net) set
+
 main :: IO ()
-main = let
-        trainingSet :: [([Value],[Value])]
-        trainingSet = [([-1,-1],[1]),([-1,1],[-1]),([1,-1],[-1]),([1,1],[1])]
-        trainedNetwork :: Network AdjacencyList
-        trainedNetwork = trainNetwork trainingSet createNetwork
-       in
-        let
-            citizen = Citizen createNetwork trainingSet
-        in
-            getStdGen >>=
-            return . fromJust . takeMax . (!! 100) . evalState (iterateM evolve =<< seedPopulation 256 citizen) >>=
-            putStrLn . show . fmap (>>= getOutput) . sequence (map (flip runNetwork) (map fst trainingSet)) . getNetwork        where
-            trainNetwork :: (Show a, IsGraph a) => [([Value],[Value])] -> Network a -> Network a
-            trainNetwork set net = fromJust $ foldl (>>=) (Just net) (replicate 10 $ flip (trainOn 10) set)
-            evalErrors :: (Show a, IsGraph a) => [([Value],[Value])] -> Network a -> [Value]
-            evalErrors set net = fromJust . sequence $ map (flip (uncurry evalError) net) set
+main = getStdGen >>=
+       putStrLn . either id show . tryEvolution
 

@@ -4,10 +4,11 @@ module FFNN where
 
 import Data.List
 import Data.Maybe
-import qualified Data.Map.Strict as Map
+import Data.Either
+import Debug.Trace
 import Control.Lens
 import Control.Applicative
-import Debug.Trace
+import qualified Data.Map.Strict as Map
 
 {- Types -}
 
@@ -78,21 +79,25 @@ updateGraph :: Network a -> a -> Network a
 updateGraph network graph = network { getGraph = graph }
 
 class Neural a where
-    getOutput :: a -> Maybe [Value]
-    runNetwork :: a -> [Value] -> Maybe a
-    trainNetwork :: a -> [Value] -> Maybe a
-    learnFrom :: [Value] -> [Value] -> a -> Maybe a
-    evalError :: [Value] -> [Value] -> a -> Maybe Value
+    getOutput :: a -> Either String [Value]
+    runNetwork :: a -> [Value] -> Either String a
+    trainNetwork :: a -> [Value] -> Either String a
+    learnFrom :: [Value] -> [Value] -> a -> Either String a
+    evalError :: [Value] -> [Value] -> a -> Either String Value
 
 instance (Show a, IsGraph a) => Neural (Network a) where
-    getOutput network = last' (getLayers network) >>=
-                        sequence . map (flip getValue (getGraph network))
+    getOutput network = maybe (Left "No layers in graph") Right (last' $ getLayers network) >>=
+                        maybe (Left "Missing value in output") Right . sequence . map (flip getValue (getGraph network))
     runNetwork network input = let
+                                layers :: Layers
                                 layers = getLayers network
+                                biases :: Maybe [Double]
                                 biases = head' layers >>=
                                          return . map (flip (Map.findWithDefault 0) $ getBias network)
+                                biasedInputs :: Maybe [Double]
                                 biasedInputs = biases >>= zipWith' ($) (map (+) input)
-                                insertions = fmap (zipWith' setValue) (head' layers) <*> biasedInputs >>= id
+                                insertions :: (Show a, IsGraph a) => Either String [a -> a]
+                                insertions = maybe (Left "Error inserting inputs") Right $ (zipWith' setValue) <$> (head' layers) <*> biasedInputs >>= id
                                 inputGraph = flip (foldl (.) id) (getGraph network) <$> insertions
                                in
                                 inputGraph >>=
@@ -100,35 +105,42 @@ instance (Show a, IsGraph a) => Neural (Network a) where
                                 return . updateGraph network
         where
             {- Flow layer x to y -}
-            go :: (Show a, IsGraph a) => Layers -> a -> Maybe a
+            go :: (Show a, IsGraph a) => Layers -> a -> Either String a
             go (x:y:ys) g = let
+                                biases :: [Double]
                                 biases = map (flip (Map.findWithDefault 0) $ getBias network) y
                             in
                                 runLayer x y g biases (getNonlin network) >>=
                                 go (y:ys)
-            go _ g = Just g
+            go _ g = return g
     trainNetwork network predic = let
+                                    reverseLayers :: Layers
                                     reverseLayers = reverse $ getLayers network
+                                    output :: Maybe [Double]
                                     output = head' reverseLayers >>=
                                              sequence . map (flip getValue (getGraph network))
-                                    errorl = output >>=
-                                             zipWith' findErr predic
+                                    errorl :: Maybe [Double]
+                                    errorl = output >>= zipWith' findErr predic
                                                 where
+                                                    findErr :: Double -> Double -> Double
                                                     findErr ex out = (ex - out) * (($ out) . snd $ getNonlin network)
-                                    insertions = fmap (zipWith' Map.insert) (head' reverseLayers) <*> errorl >>= id
+                                    insertions :: Either String [NodeMap -> NodeMap]
+                                    insertions = maybe (Left "Couldn't calculate output errors") Right $ fmap (zipWith' Map.insert) (head' reverseLayers) <*> errorl >>= id
+                                    errMap :: Either String NodeMap
                                     errMap = flip (foldl (.) id) Map.empty <$> insertions >>= calcErr reverseLayers
+                                    errList :: Either String [[Maybe Double]]
                                     errList = fmap (flip map reverseLayers . map . flip Map.lookup) errMap
                                   in
                                     (sequence . map sequence) <$> errList >>=
-                                    liftA2 (mapErr $ getGraph network) (tail' reverseLayers) >>=
-                                    fmap reverse >>=
+                                    maybe (Left "Couldn't calculate error values") Right . liftA2 (mapErr $ getGraph network) (tail' reverseLayers) >>=
+                                    maybe (Left "Failed to map error values") Right . fmap reverse >>=
                                     applyWeights >>=
                                     return . updateGraph network
         where
-            calcErr :: Layers -> NodeMap -> Maybe NodeMap
+            calcErr :: Layers -> NodeMap -> Either String NodeMap
             calcErr (x:y:ys) errMap = backpropogate x y (getGraph network) (getNonlin network) errMap >>=
                                       calcErr (y:ys)
-            calcErr _ m = Just m
+            calcErr _ m = Right m
             mapErr g b@(y:ys) c@(e:es) = let
                                         vals :: Maybe [Value]
                                         vals = sequence $ map (flip getValue g) y
@@ -154,42 +166,42 @@ instance (Show a, IsGraph a) => Neural (Network a) where
                                    in
                                     applyWeights' weights layers >>=
                                     return . flip (foldl (.) id) (getGraph network)
-            applyWeights' :: (IsGraph a) => [[[Weight]]] -> Layers -> Maybe [a -> a]
+            applyWeights' :: (IsGraph a) => [[[Weight]]] -> Layers -> Either String [a -> a]
             applyWeights' (w:ws) (x:y:ys) = liftA2 (++) (applyWeights'' w x y) (applyWeights' ws (y:ys))
-            applyWeights' [] [x] = Just []
-            applyWeights' _ _ = Nothing
-            applyWeights'' :: (IsGraph a) => [[Weight]] -> Layer -> Layer -> Maybe [a -> a]
+            applyWeights' [] [x] = Right []
+            applyWeights' _ _ = Left "Error applying weights"
+            applyWeights'' :: (IsGraph a) => [[Weight]] -> Layer -> Layer -> Either String [a -> a]
             applyWeights'' (w:ws) froml@(x:xs) tol = liftA2 (++) (applyWeights''' w x tol) (applyWeights'' ws xs tol)
-            applyWeights'' [] [] _ = Just []
-            applyWeights'' a b c = Nothing
-            applyWeights''' :: (IsGraph a) => [Weight] -> Int -> Layer -> Maybe [a -> a]
+            applyWeights'' [] [] _ = Right []
+            applyWeights'' a b c = Left "Error applying weights"
+            applyWeights''' :: (IsGraph a) => [Weight] -> Int -> Layer -> Either String [a -> a]
             applyWeights''' (w:ws) from tol@(x:xs) = applyWeights''' ws from xs >>= return . (setWeight from x w :) 
-            applyWeights''' e@[] f g@[] = Just []
-            applyWeights''' a b c = Nothing
+            applyWeights''' e@[] f g@[] = Right []
+            applyWeights''' a b c = Left "Error applying weights"
     learnFrom input output network = runNetwork network input >>=
                                      flip trainNetwork output
     evalError input output network = runNetwork network input >>=
                                      getOutput >>=
-                                     zipWith' (-) output >>=
+                                     maybe (Left "Couldn't match output with supplied data") Right . zipWith' (-) output >>=
                                      return . (/2) . sum . map (\x -> x*x)
 
-backpropogate :: (Show a, IsGraph a) => Layer -> Layer -> a -> NonLinearity -> NodeMap -> Maybe NodeMap
+backpropogate :: (Show a, IsGraph a) => Layer -> Layer -> a -> NonLinearity -> NodeMap -> Either String NodeMap
 backpropogate froml tol graph nonlin errors = let
-                                                vals :: Maybe [Value]
-                                                vals = sequence $ map (flip getValue graph) tol
+                                                vals :: Either String [Value]
+                                                vals = maybe (Left "Missing value in backpropogation") Right . sequence $ map (flip getValue graph) tol
                                                 links :: [[Int]]
                                                 links = map (flip linksFrom graph) tol
-                                                weights :: Maybe [[Weight]]
-                                                weights = zipWith' findWeights tol links >>=
-                                                          sequence
+                                                weights :: Either String [[Weight]]
+                                                weights = maybe (Left "Mismatched graph during backpropogation") Right $ zipWith' findWeights tol links >>= sequence
                                                     where
+                                                        findWeights :: Int -> [Int] -> Maybe [Weight]
                                                         findWeights i os = sequence $ map (flip (getWeight i) graph) os
-                                                errorl :: Maybe [Value]
-                                                errorl = sequence $ map (flip Map.lookup errors) froml
+                                                errorl :: Either String [Value]
+                                                errorl = maybe (Left "Missing error in backpropogation") Right . sequence $ map (flip Map.lookup errors) froml
                                               in
                                                 liftA3 go weights vals errorl >>=
-                                                id >>=
-                                                update tol
+                                                maybe (Left "Failed to calculate backpropogation values") Right >>=
+                                                maybe (Left "Mismatched layer in backpropogation") Right . update tol
         where
             go :: [[Weight]] -> [Value] -> [Value] -> Maybe [Value]
             go [] [] _ = Just []
@@ -205,21 +217,21 @@ backpropogate froml tol graph nonlin errors = let
                                   in
                                     fmap (foldl (flip ($)) errors) insertions
 
-runLayer :: (Show a, IsGraph a) => Layer -> Layer -> a -> [Value] -> NonLinearity -> Maybe a
+runLayer :: (Show a, IsGraph a) => Layer -> Layer -> a -> [Value] -> NonLinearity -> Either String a
 runLayer inl outl graph obias nonlin = let
-                                        vals :: Maybe [Value]
-                                        vals = sequence $ map (flip getValue graph) inl
+                                        vals :: Either String [Value]
+                                        vals = maybe (Left "Missing value in feedforward") Right . sequence $ map (flip getValue graph) inl
                                         links :: [[Int]]
                                         links = map (flip linksFrom graph) inl
-                                        weights :: Maybe [[Weight]]
-                                        weights = zipWith' findWeights inl links >>=
-                                                  sequence
+                                        weights :: Either String [[Weight]]
+                                        weights = maybe (Left "Mismatched graph during feedforward") Right $ zipWith' findWeights inl links >>= sequence
                                             where
+                                                findWeights :: Int -> [Int] -> Maybe [Weight]
                                                 findWeights i os = sequence $ map (flip (getWeight i) graph) os
                                        in
                                         liftA2 (go obias) (fmap transpose weights) vals >>=
-                                        id >>=
-                                        update outl
+                                        maybe (Left "Failed to calculated feedforward values") Right >>=
+                                        maybe (Left "Mismatched layer in feedforward") Right . update outl
         where
             go :: [Value] -> [[Weight]] -> [Value] -> Maybe [Value]
             go [] [] _ = Just []
@@ -287,6 +299,21 @@ step = (f, f')
             f' x = 0 / 1
 
 {- Code -}
+
+trainOn :: (Show a, IsGraph a) => Int -> Network a -> [([Value],[Value])] -> Either String (Network a)
+trainOn n network dataset = foldl (>>=) (Right network) $ map (trainN n) dataset
+        where
+            trainN :: (Show a, IsGraph a) => Int -> ([Value],[Value]) -> Network a -> Either String (Network a)
+            trainN 0 input net = Right net
+            trainN n input net = uncurry learnFrom input net >>=
+                                 trainN (n-1) input
+
+mapNetwork :: (Show a, IsGraph a) => [[Value]] -> Network a -> Either String [([Value],[Value])]
+mapNetwork inputs net = let
+                            outputs :: Either String [[Value]]
+                            outputs = sequence $ map ((>>= getOutput) . runNetwork net) inputs
+                        in
+                            zip inputs <$> outputs
 
 createNetwork' :: Network AdjacencyList
 createNetwork' = Network graph layers nonlin alpha bias
