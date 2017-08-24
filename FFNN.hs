@@ -1,5 +1,7 @@
 {-# LANGUAGE FlexibleInstances #-}
 
+module FFNN where
+
 import Data.List
 import Data.Maybe
 import qualified Data.Map.Strict as Map
@@ -17,7 +19,7 @@ type Value = Double
 type NodeMap = Map.Map Int Value
 
 data AdjacencyList = Adjacency (Map.Map (Int, Int) Weight) NodeMap deriving (Show)
-data Matrix = Matrix ([[Maybe Weight]]) NodeMap deriving (Show)
+data Matrix = Matrix [[Maybe Weight]] NodeMap deriving (Show)
 
 class IsGraph a where
     getWeight :: Int -> Int -> a -> Maybe Weight
@@ -25,6 +27,7 @@ class IsGraph a where
     setWeight :: Int -> Int -> Weight -> a -> a
     setValue :: Int -> Value -> a -> a
     linksFrom :: Int -> a -> [Int]
+    listNodes :: a -> [Int]
 
 instance IsGraph AdjacencyList where
     getWeight from to (Adjacency graph _) = Map.lookup (from, to) graph
@@ -38,6 +41,7 @@ instance IsGraph AdjacencyList where
                                                 in
                                                     Adjacency graph newNodes
     linksFrom node (Adjacency graph _) = map snd . Map.keys . Map.filterWithKey (\k _ -> fst k == node) $ graph
+    listNodes (Adjacency graph _) = nub . sort . foldl (\l (a,b) -> a:b:l) [] . Map.keys $ graph
 
 instance IsGraph Matrix where
     getWeight from to (Matrix graph _) = graph ^? element from . element to >>= id
@@ -51,6 +55,7 @@ instance IsGraph Matrix where
                                              in
                                                 Matrix graph newNodes
     linksFrom node (Matrix graph _) = concat $ graph ^? element node >>= return . findIndices isJust
+    listNodes (Matrix graph _) = map fst . zip [0..] $ graph 
 
 {- Networks -}
 
@@ -283,13 +288,13 @@ step = (f, f')
 
 {- Code -}
 
-createNetwork :: Network AdjacencyList
-createNetwork = Network graph layers nonlin alpha bias
+createNetwork' :: Network AdjacencyList
+createNetwork' = Network graph layers nonlin alpha bias
         where
             graph = Adjacency (connectGraph Map.empty) Map.empty
             layers = [[0,1],[2,3,4],[5]]
-            nonlin = sigmoid
-            alpha = -1.0
+            nonlin = step
+            alpha = -0.01
             bias = Map.empty
             connectGraph = Map.insert (0,2) 0
                          . Map.insert (0,3) 1
@@ -301,34 +306,18 @@ createNetwork = Network graph layers nonlin alpha bias
                          . Map.insert (3,5) (-2)
                          . Map.insert (4,5) 1
 
-trainOn :: (Show a, IsGraph a) => Int -> Network a -> [([Value],[Value])] -> Maybe (Network a)
-trainOn n network dataset = foldl (>>=) (Just network) $ map (trainN n) dataset
+createNetwork :: Network AdjacencyList
+createNetwork = Network graph layers nonlin alpha bias
         where
-            trainN :: (Show a, IsGraph a) => Int -> ([Value],[Value]) -> Network a -> Maybe (Network a)
-            trainN 0 input net = Just net
-            trainN n input net = uncurry learnFrom input net >>=
-                                 trainN (n-1) input
-
-mapNetwork :: (Show a, IsGraph a) => [[Value]] -> Network a -> [([Value],[Value])]
-mapNetwork inputs net = let
-                            outputs :: [[Value]]
-                            outputs = fromJust . sequence $ map ((>>= getOutput) . runNetwork net) inputs
-                        in
-                            zip inputs outputs
-
-main :: IO ()
-main = let
-        trainingSet :: [([Value],[Value])]
-        trainingSet = [([-1,-1],[1]),([-1,1],[-1]),([1,-1],[-1]),([1,1],[1])]
-        trainedNetwork :: Network AdjacencyList
-        trainedNetwork = trainNetwork trainingSet createNetwork
-       in
-        (putStrLn . show . evalErrors trainingSet) trainedNetwork >>
-        (putStrLn . show) trainedNetwork >>
-        (mapM_ (putStrLn . show) . mapNetwork (map fst trainingSet)) trainedNetwork
-        where
-            trainNetwork :: (Show a, IsGraph a) => [([Value],[Value])] -> Network a -> Network a
-            trainNetwork set net = fromJust $ foldl (>>=) (Just net) (replicate 10 $ flip (trainOn 10) set)
-            evalErrors :: (Show a, IsGraph a) => [([Value],[Value])] -> Network a -> [Value]
-            evalErrors set net = fromJust . sequence $ map (flip (uncurry evalError) net) set
+            graph = Adjacency (connectGraph Map.empty) Map.empty
+            layers = [[0,1],[2,3],[4]]
+            nonlin = sigmoid
+            alpha = -0.004
+            bias = Map.empty
+            connectGraph = Map.insert (0,2) 1
+                         . Map.insert (0,3) 1
+                         . Map.insert (1,2) 1
+                         . Map.insert (1,3) 1
+                         . Map.insert (2,4) 1
+                         . Map.insert (3,4) 1
 
