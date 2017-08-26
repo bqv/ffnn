@@ -1,5 +1,26 @@
+{-# LANGuagE FlexibleContexts #-}
 
 module Util where
+
+import Control.Monad.Writer
+
+{- Logging -}
+
+writeLogF :: (MonadWriter [String] m) => (a -> String) -> a -> m ()
+writeLogF f x = tell [f x]
+
+writeLog :: (MonadWriter [String] m) => String -> m ()
+writeLog w = tell [w]
+
+traceLogF :: (MonadWriter [String] m) => (a -> String) -> a -> m a
+traceLogF f x = tell [f x] >>
+                return x
+
+traceLog :: (MonadWriter [String] m) => String -> a -> m a
+traceLog w x = tell [w] >>
+               return x
+
+{- Util -}
 
 head' :: [a] -> Maybe a
 head' (x:xs) = Just x

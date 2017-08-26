@@ -3,7 +3,10 @@
 module GA (
     module GA,
     module System.Random,
-    module Control.Monad.State
+    module Control.Monad.State,
+    module Control.Monad.Writer,
+    module Control.Monad.Reader,
+    module Control.Monad.Trans.Except
 ) where
 
 import Util
@@ -19,7 +22,9 @@ import Unsafe.Coerce
 import System.Random
 import Control.Applicative
 import Control.Monad.State
-import Control.Monad.Trans.Maybe
+import Control.Monad.Writer
+import Control.Monad.Reader
+import Control.Monad.Trans.Except
 import Data.ByteString (ByteString, pack, unpack)
 import qualified Data.Map.Strict as Map
 
@@ -47,19 +52,20 @@ instance Chromosome ByteString where
     sequenceGene = concat . fmap (printf "%02X") . unpack
     emptyGene = pack [0,0,0,0]
 
-mutateChromosome :: ByteString -> State StdGen ByteString
+mutateChromosome :: ByteString -> ExceptT String (StateT StdGen (ReaderT Float (Writer [String]))) ByteString
 mutateChromosome = fmap pack . sequence . fmap mutateByte . unpack
         where
-            mutateByte :: Word8 -> State StdGen Word8
+            mutateByte :: Word8 -> ExceptT String (StateT StdGen (ReaderT Float (Writer [String]))) Word8
             mutateByte byte = let
                                 diceRoll = state $ randomR (0, 1)
                                 targetBit = state $ randomR (0, 7)
                               in
-                                liftM2 (doMutate byte) diceRoll targetBit
-            doMutate :: Word8 -> Float -> Int -> Word8
-            doMutate byte diceRoll targetBit = if diceRoll < 0.1
-                                               then complementBit byte targetBit
-                                               else byte
+                                ask >>=
+                                (liftM2 (doMutate byte) diceRoll targetBit <*>) . pure
+            doMutate :: Word8 -> Float -> Int -> Float -> Word8
+            doMutate byte diceRoll targetBit coeff = if diceRoll < coeff
+                                                     then complementBit byte targetBit
+                                                     else byte
 
 data Citizen a = Citizen {
     getNetwork :: a,
@@ -68,40 +74,51 @@ data Citizen a = Citizen {
 
 type Genotype a = [a]
 
-mutateGen :: Genotype ByteString -> State StdGen (Genotype ByteString)
+sequenceGenotype :: Genotype ByteString -> String
+sequenceGenotype = concat . map sequenceGene
+
+mutateGen :: Genotype ByteString -> ExceptT String (StateT StdGen (ReaderT Float (Writer [String]))) (Genotype ByteString)
 mutateGen = sequence . fmap mutateChromosome
 
-crossoverGen :: Genotype ByteString -> Genotype ByteString -> State StdGen (Maybe (Genotype ByteString))
+crossoverGen :: Genotype ByteString -> Genotype ByteString -> ExceptT String (StateT StdGen (ReaderT Float (Writer [String]))) (Maybe (Genotype ByteString))
 crossoverGen left right = sequence . fmap sequence $ zipWith' chooseChromosome left right
         where
-            chooseChromosome :: ByteString -> ByteString -> State StdGen ByteString
+            chooseChromosome :: ByteString -> ByteString -> ExceptT String (StateT StdGen (ReaderT Float (Writer [String]))) ByteString
             chooseChromosome left right = state (randomR (0, 1)) >>=
                                           return . ([left, right] !!)
 
 class HasGenotype a where
-    mutate :: a -> State StdGen (Either String a)
+    mutate :: a -> ExceptT String (StateT StdGen (ReaderT Float (Writer [String]))) (Either String a)
     mutate citizen = let
                         mutant = toGenotype citizen >>= return . fmap fromGenotype . sequence . fmap mutateGen
                      in
-                        fmap (maybe (Left "Failed in mutation genotype conversion") Right . (>>= id)) . sequence $ mutant
-    crossover :: a -> a -> State StdGen (Either String a)
+                        writeLog ("Mutating citizen: " ++ (maybe "<Corpse?>" (sequenceGenotype . snd) $ toGenotype citizen)) >>
+                        (fmap (maybe (Left "Failed in mutation genotype conversion") Right . (>>= id)) . sequence $ mutant) >>=
+                        traceLogF (("Mutated citizen to: "++) . either (const "<Corpse?>") (maybe "<Corpse?>" (sequenceGenotype . snd) . toGenotype))
+    crossover :: a -> a -> ExceptT String (StateT StdGen (ReaderT Float (Writer [String]))) (Either String a)
     crossover left right = let
                             leftGen = snd <$> toGenotype left
                             rightGen = snd <$> toGenotype right
                             child = liftM2 crossoverGen leftGen rightGen >>=
                                     return . fmap ((fromGenotype . (,) left) =<<)
                            in
-                            fmap (maybe (Left "Failed in crossover genotype conversion") Right . (>>= id)) . sequence $ child
+                            writeLog ("Breeding citizens: " ++ (maybe "<Corpse?>" sequenceGenotype leftGen) ++ ", " ++ (maybe "<Corpse?>" sequenceGenotype rightGen)) >>
+                            (fmap (maybe (Left "Failed in crossover genotype conversion") Right . (>>= id)) . sequence $ child) >>=
+                            traceLogF (("Created child: "++) . either (const "<Corpse?>") (maybe "<Corpse?>" (sequenceGenotype . snd) . toGenotype))
 
-    fitness :: a -> Double
+    fitness :: a -> Writer [String] Double
     toGenotype :: a -> Maybe (a, Genotype ByteString)
     fromGenotype :: (a, Genotype ByteString) -> Maybe a
 
 instance (Show a, IsGraph a) => HasGenotype (Citizen (Network a)) where
-    fitness (Citizen net set) = either (dropWith $ 1 / 0) sum . sequence $ map (flip (uncurry evalError) net) set
+    fitness (Citizen net set) = writeLog ("Valuating network: " ++ (show net)) >>
+                                runExceptT (sequence $ map (flip (uncurry evalError) net) set) >>=
+                                either (dropWith $ 1 / 0) (return . sum) >>=
+                                traceLogF (("Got fitness: "++) . show)
             where
-                dropWith :: Double -> String -> Double
-                dropWith = const
+                dropWith :: Double -> String -> Writer [String] Double
+                dropWith x e = writeLog ("Dropping citizen: " ++ e) >>
+                               pure x
     toGenotype citizen = let
                             graph = getGraph $ getNetwork citizen
                             layers = getLayers $ getNetwork citizen
@@ -132,13 +149,13 @@ instance (Show a, IsGraph a) => HasGenotype (Citizen (Network a)) where
 
 type Population a = [Citizen a]
 
-evolve :: (Show a, IsGraph a) => Population (Network a) -> State StdGen (Population (Network a))
+evolve :: (Show a, IsGraph a) => Population (Network a) -> ExceptT String (StateT StdGen (ReaderT Float (Writer [String]))) (Population (Network a))
 evolve pop = let
                 elite = take 16 $ sortOn fitness pop
              in
                 breed elite
         where
-            breed :: (Show a, IsGraph a) => Population (Network a) -> State StdGen (Population (Network a))
+            breed :: (Show a, IsGraph a) => Population (Network a) -> ExceptT String (StateT StdGen (ReaderT Float (Writer [String]))) (Population (Network a))
             breed parents = fmap dropLefts (sequence $ crossover <$> parents <*> parents) >>=
                             fmap ((parents ++) . dropLefts) . sequence . map mutate
             dropLefts :: [Either String a] -> [a]
@@ -147,11 +164,12 @@ evolve pop = let
 takeMax :: (Show a, IsGraph a) => Population (Network a) -> Either String (Citizen (Network a))
 takeMax = maybe (Left "Can't sample an empty population") Right . head' . sortOn fitness
 
-seedPopulation :: (Show a, IsGraph a) => Int -> Citizen (Network a) -> State StdGen (Population (Network a))
-seedPopulation count seed = fmap catMaybes . sequence $ replicate count (randomize seed)
+seedPopulation :: (Show a, IsGraph a) => Int -> Citizen (Network a) -> ExceptT String (StateT StdGen (ReaderT Float (Writer [String]))) (Population (Network a))
+seedPopulation count seed = writeLog ("Seeding population of " ++ (show count) ++ " from: " ++ (show seed)) >>
+                            (fmap catMaybes . sequence $ replicate count (randomize seed))
         where
-            randomize :: (Show a, IsGraph a) => Citizen (Network a) -> State StdGen (Maybe (Citizen (Network a)))
+            randomize :: (Show a, IsGraph a) => Citizen (Network a) -> ExceptT String (StateT StdGen (ReaderT Float (Writer [String]))) (Maybe (Citizen (Network a)))
             randomize = fmap (>>= id) . sequence . fmap (fmap fromGenotype . sequence . fmap (sequence . map (const randomBytes))) . toGenotype
-            randomBytes :: State StdGen ByteString
+            randomBytes :: ExceptT String (StateT StdGen (ReaderT Float (Writer [String]))) ByteString
             randomBytes = fmap pack . sequence . replicate 4 $ state random
 
